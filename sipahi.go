@@ -72,9 +72,9 @@ func intervalSaveCache(file string, cacheref *cache.Cache) {
 	save := func() {
 		err := cacheref.SaveFile(file)
 		if err == nil {
-			fmt.Printf("cache saved: %s\n", file)
+			//fmt.Printf("cache saved: %s\n", file)
 		} else {
-			fmt.Printf("cache save failed: %s, %s\n", file, err)
+			//fmt.Printf("cache save failed: %s, %s\n", file, err)
 		}
 	}
 
@@ -195,7 +195,27 @@ func init() {
 func generateReqKey(req *dns.Msg) string {
 	id := req.Id
 	req.Id = 0
-	key := toMd5(req.String())
+	// delete cookie if present
+	if len(req.Extra) != 0 {
+		for _, extra := range req.Extra {
+			// Check if EDNS OPT type
+			if extra.Header().Rrtype != dns.TypeOPT {
+				continue
+			}
+			pos := 0
+			opt := extra.(*dns.OPT)
+			// For Each Option Chck the option Code
+			for _, ednsOption := range opt.Option {
+				if ednsOption.Option() == dns.EDNS0COOKIE {
+					opt.Option = append(opt.Option[:pos], opt.Option[pos+1:]...)
+					break
+				}
+				pos++
+			}
+		}
+	}
+	str := req.String()
+	key := toMd5(str)
 	req.Id = id
 	return key
 }
@@ -319,7 +339,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 
 	/************************ FILTER REQUEST *************************/
 
-	// If its a Response we treat it as Invalid (DROP)
+	// If its a Response, we treat it as Invalid (DROP)
 	if req.MsgHdr.Response == true {
 		return
 	}
@@ -380,6 +400,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 	if data != nil && len(data) > 0 {
 		// Validate the Request
 		m = &dns.Msg{}
+		// unpack earlier req
 		m.Unpack(data)
 		invalidate := false
 		reason := ""
@@ -406,25 +427,26 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			reason = fmt.Sprintf("Questions Doesn't match: %s %s", req.Question[0], m.Question[0])
 			invalidate = true
 
-		/* NOTE: We currently validate the cookie by regenerating the server cookie which is dependent
-		 *       on the client cookie
-		 *       It is assumed from a specific client the client cookie mast be same in consicutive req
-		 *       although the behaviour of the client cookie generation is not fully understood
-		 *       Currently the client cookie is fixed with a hex(24)
-		 */
+			/* NOTE: We currently validate the cookie by regenerating the server cookie which is dependent
+			 *       on the client cookie
+			 *       It is assumed from a specific client the client cookie mast be same in consicutive req
+			 *       although the behaviour of the client cookie generation is not fully understood
+			 *       Currently the client cookie is fixed with a hex(24)
+			 */
 
-		/* TODO: Check If cookie is not present although it was present in the initial req, it should
-		 *       be invalidated
-		 *
-		 *       In case no cookie support is revealed from client it will be enforced to have limited
-		 *       size otherwise force the remaining to communicate over TCP by sending back responses
-		 *       with the TC flag set
-		 */
-		case cookiePresent(req):
-			if !validCookie(req, w) {
-				reason = fmt.Sprintf("Invalid cookie provided")
-			}
-			invalidate = true
+			/* TODO: Check If cookie is not present although it was present in the initial req, it should
+			 *       be invalidated
+			 *
+			 *       In case no cookie support is revealed from client it will be enforced to have limited
+			 *       size otherwise force the remaining to communicate over TCP by sending back responses
+			 *       with the TC flag set
+			 */
+			/*
+				case cookiePresent(req):
+					if !validCookie(req, w) {
+						reason = fmt.Sprintf("Invalid cookie provided")
+					}
+					invalidate = true*/
 		}
 
 		if invalidate {
@@ -433,11 +455,6 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			err = errors.New(errlog)
 			goto end
 		} else {
-			/* TODO: Generate the revalidation period as of the TTL
-			 *       Current revalidation period is fixed for each request we might want to enforece
-			 *       the revalidation period based on the DNS resp ttl
-			 */
-			validitycache.Set(validationKey, data, time.Second*time.Duration(*revalidation))
 			// Before going to ask DNS, map the alias request to its actual Domain
 			// TODO: Do it for Each of the Quesions in Req
 			//       There should be a CNAME entry in the validity data that maps to actual query
@@ -455,9 +472,15 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			// MAP Domain from CNAME
 			req.Question = resolveDomainFromCname(req.Question, m.Answer)
 
+			/* TODO: Generate the revalidation period as of the TTL
+			 *       Current revalidation period is fixed for each request we might want to enforece
+			 *       the revalidation period based on the DNS resp ttl
+			 */
+			validatedRequesterKey := generateValidationKey(req, w)
+			validatedcache.Set(validatedRequesterKey, data, time.Second*time.Duration(*revalidation))
+
 			goto dns
 		}
-
 	}
 
 	// If Cache Enable check if we have already cached the content
@@ -536,15 +559,16 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		 *       Although it is still not fully understood if the client is
 		 *       responsible for initiating edns cookies
 		 */
-		o := new(dns.OPT)
-		o.Hdr.Name = "."
-		o.Hdr.Rrtype = dns.TypeOPT
-		e := new(dns.EDNS0_COOKIE)
-		e.Code = dns.EDNS0COOKIE
-		e.Cookie = CLIENTDUMMYCOOKIE + generateServerCookie(CLIENTDUMMYCOOKIE, SERVERSECRET, strings.Split(w.RemoteAddr().String(), ":")[0])
-		o.Option = append(o.Option, e)
-		m.Extra = append(m.Extra, o)
-
+		/*
+			o := new(dns.OPT)
+			o.Hdr.Name = "."
+			o.Hdr.Rrtype = dns.TypeOPT
+			e := new(dns.EDNS0_COOKIE)
+			e.Code = dns.EDNS0COOKIE
+			e.Cookie = CLIENTDUMMYCOOKIE + generateServerCookie(CLIENTDUMMYCOOKIE, SERVERSECRET, strings.Split(w.RemoteAddr().String(), ":")[0])
+			o.Option = append(o.Option, e)
+			m.Extra = append(m.Extra, o)
+		*/
 		// If validation needed set the validation cache for future reference
 		if validationNeeded {
 			req.Question = questions
@@ -593,9 +617,7 @@ dns:
 		if proto == "tcp" {
 			client = clientTCP
 		}
-		fmt.Printf("\nDNS Req: \n%v\n\n", req)
 		m, _, err = client.Exchange(req, dns)
-		fmt.Printf("\nDNS Resp: \n%v\n\n", m)
 		if err == nil && len(m.Answer) > 0 {
 			// used = dns
 			break
