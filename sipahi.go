@@ -62,6 +62,18 @@ var (
 	validationCFile = "validation_cache.dat"
 )
 
+// the request state
+const (
+	FILTER_REQ       = 0
+	PARSE_REQ        = 1
+	RESP_CACHE_CHECK = 2
+	VALIDATE         = 3
+	VALIDITY_CHECK   = 4
+	PERFORM_DNS      = 5
+	SEND_RESP        = 6
+	END              = 7
+)
+
 func toMd5(data string) string {
 	m := md5.New()
 	m.Write([]byte(data))
@@ -327,6 +339,8 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		cachedAns      []dns.RR
 		answers        []dns.RR
 		r              dns.RR
+		reqState       int
+		complete       bool
 		//clientIp       string
 		//clientPort     string
 	)
@@ -337,345 +351,363 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}()
 
-	/************************ FILTER REQUEST *************************/
+	// set initial req state
+	complete = false
+	reqState = FILTER_REQ
 
-	// If its a Response, we treat it as Invalid (DROP)
-	if req.MsgHdr.Response == true {
-		return
-	}
+	// request state wheel
+	for !complete {
+		// Case to match the exact state of the request
+		switch reqState {
 
-	query = make([]string, len(req.Question))
+		case FILTER_REQ:
+			// If its a Response, we treat it as Invalid (DROP)
+			if req.MsgHdr.Response == true {
+				return
+			}
 
-	// Filter out IPV6 and AAAA Entry from queries (DROP)
-	for i, q := range req.Question {
-		if q.Qtype != dns.TypeAAAA || *ipv6 {
-			questions = append(questions, q)
-		}
-		query[i] = fmt.Sprintf("(%s %s %s)", q.Name, dns.ClassToString[q.Qclass], dns.TypeToString[q.Qtype])
-	}
+			query = make([]string, len(req.Question))
 
-	// Invalid Question Length (DROP)
-	if len(questions) == 0 {
-		return
-	}
+			// Filter out IPV6 and AAAA Entry from queries (DROP)
+			for i, q := range req.Question {
+				if q.Qtype != dns.TypeAAAA || *ipv6 {
+					questions = append(questions, q)
+				}
+				query[i] = fmt.Sprintf("(%s %s %s)", q.Name, dns.ClassToString[q.Qclass], dns.TypeToString[q.Qtype])
+			}
 
-	/* TODO: sipahi should support multiple query but DNS doesn't
-	 *       We sould be able to integently Distribute the
-	 *       questions to multiple DNSs in different request
-	 */
-	req.Question = questions
+			// Invalid Question Length (DROP)
+			if len(questions) == 0 {
+				return
+			}
 
-	/*********************** PERFORM REQUEST ***************************/
+			/* TODO: sipahi should support multiple query but DNS doesn't
+			 *       We sould be able to integently Distribute the
+			 *       questions to multiple DNSs in different request
+			 */
+			req.Question = questions
 
-	// generate the validation key and Request Key
-	id = req.Id
-	req.Id = 0
-	// Generate validation key
-	validationKey = generateValidationKey(req, w)
-	// Generate the request key
-	reqKey = generateReqKey(req)
-	req.Id = id
+			reqState = PARSE_REQ
+			fallthrough
 
-	/*
-		switch {
-		case ENCACHE && isCached(reqKey):
-			err = performCache()
-		case isValidationResolution(validationKey):
-			oldreq, err := validateReq(req, w, validationKey)
-			if err != nil {
+		case PARSE_REQ:
+			// generate the validation key and Request Key
+			id = req.Id
+			req.Id = 0
+			// Generate validation key
+			validationKey = generateValidationKey(req, w)
+			// Generate the request key
+			reqKey = generateReqKey(req)
+			req.Id = id
+
+			reqState = RESP_CACHE_CHECK
+			fallthrough
+
+		case RESP_CACHE_CHECK:
+			// If Cache Enable check if we have already cached the content
+			if ENCACHE {
+				if reply, ok := respcache.Get(reqKey); ok {
+					data, _ = reply.([]byte)
+				}
+				if data != nil && len(data) > 0 {
+					m = &dns.Msg{}
+					m.Unpack(data)
+					m.Id = id
+					data, err = m.Pack()
+					if err != nil {
+						reqState = END
+						break
+					}
+					reqState = SEND_RESP
+					break
+					//err = w.WriteMsg(m)
+					//goto end
+				}
+			}
+			reqState = VALIDATE
+			fallthrough
+
+		case VALIDATE:
+			// Check if CNAME query of earlier request
+			if earlierreq, ok := validitycache.Get(validationKey); ok {
+				data, _ = earlierreq.([]byte)
+			}
+			if data == nil || len(data) == 0 {
+				reqState = VALIDITY_CHECK
 				break
 			}
-			err = performGslb(req, oldreq)
-		case isValidated(validationKey):
-			err := initiateValidation(req, validationKey)
-		}
-		if err != nil {
+			// Validate the Request
+			m = &dns.Msg{}
+			// unpack earlier req
+			m.Unpack(data)
+			invalidate := false
+			reason := ""
+			switch {
 
-		}*/
-
-	// Check if it is a resolution request for cname for an earlier request
-	if earlierreq, ok := validitycache.Get(validationKey); ok {
-		data, _ = earlierreq.([]byte)
-	}
-	if data != nil && len(data) > 0 {
-		// Validate the Request
-		m = &dns.Msg{}
-		// unpack earlier req
-		m.Unpack(data)
-		invalidate := false
-		reason := ""
-		switch {
-
-		/*
-		 * NOTE: It was initially assumed that if DNS set the RecursicnAvailable flag as 0, the dns
-		 *       resolver mast not ask about recursive query
-		 *       although It is found even if the resolver replied recursion is unavialble
-		 *       it can ask for recursion; which makes the below condition risky
-		 *
-		 *       case req.RecursionDesired:
-		 *            reason = "Recursion desired"
-		 *            invalidate = true
-		 */
-
-		/*
-		 * TODO: Check if all the question that is asked in req.Question belongs to m.Question
-		 *       Reason:
-		 *       The order of the question in 2nd query dependent on resolver logic
-		 *       Its highly impractical that for a multiple query to check the question one by one
-		 */
-		case req.Question[0] != m.Question[0]:
-			reason = fmt.Sprintf("Questions Doesn't match: %s %s", req.Question[0], m.Question[0])
-			invalidate = true
-
-			/* NOTE: We currently validate the cookie by regenerating the server cookie which is dependent
-			 *       on the client cookie
-			 *       It is assumed from a specific client the client cookie mast be same in consicutive req
-			 *       although the behaviour of the client cookie generation is not fully understood
-			 *       Currently the client cookie is fixed with a hex(24)
+			/*
+			 * NOTE: It was initially assumed that if DNS set the RecursicnAvailable flag as 0, the dns
+			 *       resolver mast not ask about recursive query
+			 *       although It is found even if the resolver replied recursion is unavialble
+			 *       it can ask for recursion; which makes the below condition risky
+			 *
+			 *       case req.RecursionDesired:
+			 *            reason = "Recursion desired"
+			 *            invalidate = true
 			 */
 
-			/* TODO: Check If cookie is not present although it was present in the initial req, it should
-			 *       be invalidated
-			 *
-			 *       In case no cookie support is revealed from client it will be enforced to have limited
-			 *       size otherwise force the remaining to communicate over TCP by sending back responses
-			 *       with the TC flag set
+			/*
+			 * TODO: Check if all the question that is asked in req.Question belongs to m.Question
+			 *       Reason:
+			 *       The order of the question in 2nd query dependent on resolver logic
+			 *       Its highly impractical that for a multiple query to check the question one by one
+			 */
+			case req.Question[0] != m.Question[0]:
+				reason = fmt.Sprintf("Questions Doesn't match: %s %s", req.Question[0], m.Question[0])
+				invalidate = true
+
+				/* NOTE: We currently validate the cookie by regenerating the server cookie which is dependent
+				 *       on the client cookie
+				 *       It is assumed from a specific client the client cookie mast be same in consicutive req
+				 *       although the behaviour of the client cookie generation is not fully understood
+				 *       Currently the client cookie is fixed with a hex(24)
+				 */
+
+				/* TODO: Check If cookie is not present although it was present in the initial req, it should
+				 *       be invalidated
+				 *
+				 *       In case no cookie support is revealed from client it will be enforced to have limited
+				 *       size otherwise force the remaining to communicate over TCP by sending back responses
+				 *       with the TC flag set
+				 */
+				/*
+					case cookiePresent(req):
+						if !validCookie(req, w) {
+							reason = fmt.Sprintf("Invalid cookie provided")
+						}
+						invalidate = true*/
+			}
+
+			if invalidate {
+				// If Invalidated the error is logged for the specific client
+				errlog := fmt.Sprintf("Invaid req, incident would be logged, reason: %s", reason)
+				err = errors.New(errlog)
+				reqState = END
+				break
+			} else {
+				// Before going to ask DNS, map the alias request to its actual Domain
+				// TODO: Do it for Each of the Quesions in Req
+				//       There should be a CNAME entry in the validity data that maps to actual query
+
+				// Keep a backup of questions for response
+				for _, q := range req.Question {
+					actualQuestion = append(actualQuestion, q)
+				}
+
+				// Keep a backup of questions for response
+				for _, a := range m.Answer {
+					cachedAns = append(cachedAns, a)
+				}
+
+				// MAP Domain from CNAME
+				req.Question = resolveDomainFromCname(req.Question, m.Answer)
+
+				/* TODO: Generate the revalidation period as of the TTL
+				 *       Current revalidation period is fixed for each request we might want to enforece
+				 *       the revalidation period based on the DNS resp ttl
+				 */
+				validatedRequesterKey := generateValidationKey(req, w)
+				validatedcache.Set(validatedRequesterKey, data, time.Second*time.Duration(*revalidation))
+
+				reqState = PERFORM_DNS
+				break
+			}
+			reqState = VALIDITY_CHECK
+			fallthrough
+
+		case VALIDITY_CHECK:
+			// Check if the req is Validated
+			if reply, ok := validatedcache.Get(validationKey); ok {
+				data, _ = reply.([]byte)
+			}
+			if data != nil && len(data) > 0 {
+				reqState = PERFORM_DNS
+				break
+			}
+			// Send an response with CNAME with recursive unavailable flag set
+			// Create resp to client
+			m := new(dns.Msg)
+			// Generate a reply message based on the request Received
+			m.SetReply(req)
+			// We do not provide recursive resolution
+			m.RecursionAvailable = false
+			// We are sending ans
+			m.Response = true
+			m.Question = nil
+
+			// Generate LDNS Key
+			ldns_key := toMd5(w.RemoteAddr().String() + w.RemoteAddr().Network())
+			questions = nil
+			// Flag to check if validation needed
+			validationNeeded := false
+			// Populate Upcomiming CNAME req Questions
+			for _, q := range req.Question {
+				if q.Name == "." {
+					aRecord := new(dns.A)
+					aRecord.Hdr = dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(*ttl)}
+					aRecord.A = net.ParseIP("10.40.221.132")
+					r = aRecord
+				} else {
+					cnRecord := new(dns.CNAME)
+					ansCname := ldns_key + "." + q.Name
+					cnRecord.Hdr = dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: uint32(*ttl)}
+					cnRecord.Target = ansCname
+					if err != nil {
+						continue
+					}
+					r = cnRecord
+
+					// Create question that will be store at validity cache
+					q.Name = ansCname
+					questions = append(questions, q)
+					validationNeeded = true
+				}
+				answers = append(answers, r)
+			}
+
+			m.Answer = answers
+			m.Question = req.Question
+			m.RecursionDesired = req.RecursionDesired
+			m.RecursionAvailable = false
+
+			// Set the EDNS cookies
+			/*
+			 * TODO: We need to check if the client is EDNS otherwise
+			 *       we cannot force the EDNS Cookie
+			 *       Although it is still not fully understood if the client is
+			 *       responsible for initiating edns cookies
 			 */
 			/*
-				case cookiePresent(req):
-					if !validCookie(req, w) {
-						reason = fmt.Sprintf("Invalid cookie provided")
-					}
-					invalidate = true*/
-		}
+				o := new(dns.OPT)
+				o.Hdr.Name = "."
+				o.Hdr.Rrtype = dns.TypeOPT
+				e := new(dns.EDNS0_COOKIE)
+				e.Code = dns.EDNS0COOKIE
+				e.Cookie = CLIENTDUMMYCOOKIE + generateServerCookie(CLIENTDUMMYCOOKIE, SERVERSECRET, strings.Split(w.RemoteAddr().String(), ":")[0])
+				o.Option = append(o.Option, e)
+				m.Extra = append(m.Extra, o)
+			*/
+			// If validation needed set the validation cache for future reference
+			if validationNeeded {
+				req.Question = questions
+				// We put the answare (NOTE: Answer section isn't considered for Validation Key generation)
+				req.Answer = answers
+				req.Opcode = dns.OpcodeQuery
+				req.Id = 0
 
-		if invalidate {
-			// If Invalidated the error is logged for the specific client
-			errlog := fmt.Sprintf("Invaid req, incident would be logged, reason: %s", reason)
-			err = errors.New(errlog)
-			goto end
-		} else {
-			// Before going to ask DNS, map the alias request to its actual Domain
-			// TODO: Do it for Each of the Quesions in Req
-			//       There should be a CNAME entry in the validity data that maps to actual query
-
-			// Keep a backup of questions for response
-			for _, q := range req.Question {
-				actualQuestion = append(actualQuestion, q)
+				// generate the validation key
+				validationKey = generateValidationKey(req, w)
+				req.Id = id
+				data, _ = req.Pack()
+				// Set cache (We set cache before we write the Response)
+				validitycache.Set(validationKey, data, time.Second*time.Duration(*ttl))
 			}
 
-			// Keep a backup of questions for response
-			for _, a := range m.Answer {
-				cachedAns = append(cachedAns, a)
+			// Write the respose for DNS request
+			data, err = m.Pack()
+			if err != nil {
+				reqState = END
+				break
 			}
-
-			// MAP Domain from CNAME
-			req.Question = resolveDomainFromCname(req.Question, m.Answer)
-
-			/* TODO: Generate the revalidation period as of the TTL
-			 *       Current revalidation period is fixed for each request we might want to enforece
-			 *       the revalidation period based on the DNS resp ttl
-			 */
-			validatedRequesterKey := generateValidationKey(req, w)
-			validatedcache.Set(validatedRequesterKey, data, time.Second*time.Duration(*revalidation))
-
-			goto dns
-		}
-	}
-
-	// If Cache Enable check if we have already cached the content
-	if ENCACHE {
-		if reply, ok := respcache.Get(reqKey); ok {
-			data, _ = reply.([]byte)
-		}
-		if data != nil && len(data) > 0 {
-			m = &dns.Msg{}
-			m.Unpack(data)
-			m.Id = id
-			err = w.WriteMsg(m)
-
-			goto end
-		}
-	}
-
-	data = nil
-	// Check if the req is Validated
-	if reply, ok := validatedcache.Get(validationKey); ok {
-		data, _ = reply.([]byte)
-	}
-	if data != nil && len(data) > 0 {
-		goto dns
-	} else {
-		// Send an response with CNAME with recursive unavailable flag set
-		// Create resp to client
-		m := new(dns.Msg)
-		// Generate a reply message based on the request Received
-		m.SetReply(req)
-		// We do not provide recursive resolution
-		m.RecursionAvailable = false
-		// We are sending ans
-		m.Response = true
-		m.Question = nil
-
-		// Generate LDNS Key
-		ldns_key := toMd5(w.RemoteAddr().String() + w.RemoteAddr().Network())
-		questions = nil
-		// Flag to check if validation needed
-		validationNeeded := false
-		// Populate Upcomiming CNAME req Questions
-		for _, q := range req.Question {
-			if q.Name == "." {
-				aRecord := new(dns.A)
-				aRecord.Hdr = dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(*ttl)}
-				aRecord.A = net.ParseIP("10.40.221.132")
-				r = aRecord
-			} else {
-				cnRecord := new(dns.CNAME)
-				ansCname := ldns_key + "." + q.Name
-				cnRecord.Hdr = dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: uint32(*ttl)}
-				cnRecord.Target = ansCname
-				if err != nil {
-					continue
-				}
-				r = cnRecord
-
-				// Create question that will be store at validity cache
-				q.Name = ansCname
-				questions = append(questions, q)
-				validationNeeded = true
-			}
-			answers = append(answers, r)
-		}
-
-		m.Answer = answers
-		m.Question = req.Question
-		m.RecursionDesired = req.RecursionDesired
-		m.RecursionAvailable = false
-
-		// Set the EDNS cookies
-		/*
-		 * TODO: We need to check if the client is EDNS otherwise
-		 *       we cannot force the EDNS Cookie
-		 *       Although it is still not fully understood if the client is
-		 *       responsible for initiating edns cookies
-		 */
-		/*
-			o := new(dns.OPT)
-			o.Hdr.Name = "."
-			o.Hdr.Rrtype = dns.TypeOPT
-			e := new(dns.EDNS0_COOKIE)
-			e.Code = dns.EDNS0COOKIE
-			e.Cookie = CLIENTDUMMYCOOKIE + generateServerCookie(CLIENTDUMMYCOOKIE, SERVERSECRET, strings.Split(w.RemoteAddr().String(), ":")[0])
-			o.Option = append(o.Option, e)
-			m.Extra = append(m.Extra, o)
-		*/
-		// If validation needed set the validation cache for future reference
-		if validationNeeded {
-			req.Question = questions
-			// We put the answare (NOTE: Answer section isn't considered for Validation Key generation)
-			req.Answer = answers
-			req.Opcode = dns.OpcodeQuery
-			req.Id = 0
-
-			// generate the validation key
-			validationKey = generateValidationKey(req, w)
-			req.Id = id
-			data, _ = req.Pack()
-			// Set cache (We set cache before we write the Response)
-			validitycache.Set(validationKey, data, time.Second*time.Duration(*ttl))
-		}
-
-		// Write the respose for DNS request
-		data, err = m.Pack()
-		if err != nil {
-			goto end
-		}
-		_, err = w.Write(data)
-		if err != nil {
-			goto end
-		}
-
-		goto end
-	}
-
-	/**************   BELOW IS THE CODE THAT RESOLVES DOMAIN AGAINST DNS ************/
-dns:
-	// If a User is validated Ask the DNSs
-	// Currently RR:
-	//        which ever gives the Ans First would be selected
-	req.RecursionDesired = true
-
-	// Generate the reqKey
-	req.Id = 0
-	reqKey = generateReqKey(req)
-	req.Id = id
-
-	for _, parts := range DNS {
-		dns := parts[0]
-		proto := parts[1]
-		client := clientUDP
-		if proto == "tcp" {
-			client = clientTCP
-		}
-		m, _, err = client.Exchange(req, dns)
-		if err == nil && len(m.Answer) > 0 {
-			// used = dns
+			reqState = SEND_RESP
 			break
-		}
-	}
 
-	if err != nil {
-		goto end
-	}
-	m.RecursionAvailable = false
+		case PERFORM_DNS:
+			// If a User is validated Ask the DNSs
+			// Currently RR:
+			//        which ever gives the Ans First would be selected
+			req.RecursionDesired = true
 
-	// In the response the Question should have the response asked in the request
-	// domain --> <cname>.domian
-	// We already took a backup of the req Question earlier
-	m.Question = actualQuestion
+			// Generate the reqKey
+			req.Id = 0
+			reqKey = generateReqKey(req)
+			req.Id = id
 
-	// In the response the Answer should have the Question that its asked for
-	// domain --> <cname>.domain
-	// So we map the domian back to <cname>.domain
-	// We need to keep a backup as the Cache would use the actual ans
-	backupAnswer = nil
-	for _, a := range m.Answer {
-		backupAnswer = append(backupAnswer, dns.Copy(a))
-	}
-	resolveCnameFromDomian(m.Answer, cachedAns)
-	// Pack the resp message
-	data, err = m.Pack()
-	if err != nil {
-		goto end
-	}
-	// Write the data as a resp
-	_, err = w.Write(data)
-	if ENCACHE {
-		m.Id = 0
-		cttl := 0
-		if len(m.Answer) > 0 {
-			cttl = int(m.Answer[0].Header().Ttl)
-			if cttl < 0 {
-				cttl = 0
+			for _, parts := range DNS {
+				dns := parts[0]
+				proto := parts[1]
+				client := clientUDP
+				if proto == "tcp" {
+					client = clientTCP
+				}
+				m, _, err = client.Exchange(req, dns)
+				if err == nil && len(m.Answer) > 0 {
+					// used = dns
+					break
+				}
 			}
-		}
-		m.Question = req.Question
-		m.Answer = backupAnswer
-		data, err = m.Pack()
-		if err != nil {
-			goto end
-		}
-		// The cache is valid ony for the TTL provided by the actual Server
-		respcache.Set(reqKey, data, time.Second*time.Duration(cttl))
-		m.Id = id
-	}
 
-	if err != nil {
-		goto end
-	}
+			if err != nil {
+				reqState = END
+				break
+			}
+			m.RecursionAvailable = false
 
-end:
-	if err != nil {
-		fmt.Printf("id: %5d error: %v %s\n", id, query, err)
+			// In the response the Question should have the response asked in the request
+			// domain --> <cname>.domian
+			// We already took a backup of the req Question earlier
+			m.Question = actualQuestion
+
+			// In the response the Answer should have the Question that its asked for
+			// domain --> <cname>.domain
+			// So we map the domian back to <cname>.domain
+			// We need to keep a backup as the Cache would use the actual ans
+			backupAnswer = nil
+			for _, a := range m.Answer {
+				backupAnswer = append(backupAnswer, dns.Copy(a))
+			}
+			resolveCnameFromDomian(m.Answer, cachedAns)
+			// Pack the resp message
+			data, err = m.Pack()
+			if err != nil {
+				reqState = END
+				break
+			}
+			// Write the data as a resp
+			_, err = w.Write(data)
+			if ENCACHE {
+				m.Id = 0
+				cttl := 0
+				if len(m.Answer) > 0 {
+					cttl = int(m.Answer[0].Header().Ttl)
+					if cttl < 0 {
+						cttl = 0
+					}
+				}
+				m.Question = req.Question
+				m.Answer = backupAnswer
+				data, err = m.Pack()
+				if err != nil {
+					reqState = END
+					break
+				}
+				// The cache is valid ony for the TTL provided by the actual Server
+				respcache.Set(reqKey, data, time.Second*time.Duration(cttl))
+				m.Id = id
+			}
+			reqState = END
+			break
+
+		case SEND_RESP:
+			_, err = w.Write(data)
+			reqState = END
+			fallthrough
+		case END:
+			if err != nil {
+				fmt.Printf("id: %5d error: %v %s\n", id, query, err)
+			}
+			fallthrough
+		default:
+			complete = true
+		}
 	}
 }
