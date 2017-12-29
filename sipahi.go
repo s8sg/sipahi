@@ -17,10 +17,46 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	//	"sync/atomic"
 	"syscall"
 	"time"
 )
 
+// fixed values
+const (
+	// EDNS0 Cokkie Handling
+	CLIENTDUMMYCOOKIE = "24"
+	SERVERSECRET      = "CDNW"
+	// Cache file for validatedcache
+	validatedCFile = "validated_cache.dat"
+	// Cache file for validitycache
+	validationCFile = "validation_cache.dat"
+)
+
+// the request state
+const (
+	// filter request by applying static rule and defined abnormality
+	FILTER_REQ = 0
+	// parse req and generate validation and req key
+	PARSE_REQ = 1
+	// check if response cache have resp store for the request (check resp cache)
+	RESP_CACHE_CHECK = 2
+	// check if the request is a validation request (populate validation cache)
+	VALIDATE = 3
+	// check if the requester is already validated (check validation cache)
+	// else make the requester to perform validation loop by returning cname
+	VALIDITY_CHECK = 4
+	// perform dns request (send resp to the DNSs)
+	PERFORM_DNS = 5
+	// add to resp cache (populate resp cache)
+	ADD_RESP_CACHE = 6
+	// send reponse to the requester
+	SEND_RESP = 7
+	// ens of request processing
+	END = 8
+)
+
+// Flags
 var (
 	dnss         = flag.String("dns", "192.168.2.1:53:udp,8.8.8.8:53:udp,8.8.4.4:53:udp,8.8.8.8:53:tcp,8.8.4.4:53:tcp", "dns address, use `,` as sep")
 	local        = flag.String("local", ":53", "local listen address")
@@ -32,11 +68,10 @@ var (
 	respCFile    = flag.String("file", filepath.Join(path.Dir(os.Args[0]), "resp_cache.dat"), "cached file")
 	ipv6         = flag.Bool("6", false, "skip ipv6 record query AAAA")
 	timeout      = flag.Int("timeout", 200, "read/write timeout")
+)
 
-	// EDNS0 Cokkie Handling
-	CLIENTDUMMYCOOKIE = "24"
-	SERVERSECRET      = "CDNW"
-
+// req processor global variables
+var (
 	// Dns Client to perform TCP and UDP request towards DNS
 	clientTCP *dns.Client
 	clientUDP *dns.Client
@@ -55,23 +90,18 @@ var (
 	validitycache *cache.Cache
 
 	saveSig = make(chan os.Signal)
-
-	// Cache file for validatedcache
-	validatedCFile = "validated_cache.dat"
-	// Cache file for validitycache
-	validationCFile = "validation_cache.dat"
 )
 
-// the request state
-const (
-	FILTER_REQ       = 0
-	PARSE_REQ        = 1
-	RESP_CACHE_CHECK = 2
-	VALIDATE         = 3
-	VALIDITY_CHECK   = 4
-	PERFORM_DNS      = 5
-	SEND_RESP        = 6
-	END              = 7
+// statistics variables
+var (
+	totalRequestCount     uint64 = 0
+	respCacheHitCount     uint64 = 0
+	valReqCount           uint64 = 0
+	valErrCount           uint64 = 0
+	totalDnsQueryCount    uint64 = 0
+	failedDnsQueryCount   uint64 = 0
+	resolvedDnsQueryCount uint64 = 0
+	totalErrorCount       uint64 = 0
 )
 
 func toMd5(data string) string {
@@ -304,6 +334,19 @@ func generateServerCookie(clientCookie string, serverSecret string, clientIp str
 	return cookie
 }
 
+func printStats() {
+	fmt.Printf("SIPAHI STAT\n")
+	fmt.Printf("%0*c\n", 30, '-')
+	fmt.Printf("|%30.8s|%10.8s|\n", "COUNTER", "VALUE")
+	fmt.Printf("|%30.8s|%10.8f|\n", "Total Req", totalRequestCount)
+	fmt.Printf("|%30.8s|%10.8f|\n", "Cache Hit", respCacheHitCount)
+	fmt.Printf("|%30.8s|%10.8f|\n", "Validation Req", valReqCount)
+	fmt.Printf("|%30.8s|%10.8f|\n", "Validation Err", valErrCount)
+	fmt.Printf("|%30.8s|%10.8f|\n", "Dns Query", totalDnsQueryCount)
+	fmt.Printf("|%30.8s|%10.8f|\n", "Dns Failure", failedDnsQueryCount)
+	fmt.Printf("|%30.8s|%10.8f|\n", "Total Failure", totalErrorCount)
+}
+
 func main() {
 	dns.HandleFunc(".", proxyServe)
 	defer dns.HandleRemove(".")
@@ -318,9 +361,11 @@ func main() {
 		failure <- dns.ListenAndServe(*local, "udp", nil)
 	}(failure)
 
-	fmt.Printf("ready for accept connection on tcp/udp %s ...\n", *local)
+	fmt.Printf("ready for accept connection (tcp/udp) %s...\n", *local)
 
 	fmt.Println(<-failure)
+
+	printStats()
 }
 
 // This method is invoked whenever a DNS req reaches sipahi
@@ -420,8 +465,6 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 					}
 					reqState = SEND_RESP
 					break
-					//err = w.WriteMsg(m)
-					//goto end
 				}
 			}
 			reqState = VALIDATE
@@ -672,8 +715,10 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 				reqState = END
 				break
 			}
-			// Write the data as a resp
-			_, err = w.Write(data)
+			reqState = ADD_RESP_CACHE
+			fallthrough
+
+		case ADD_RESP_CACHE:
 			if ENCACHE {
 				m.Id = 0
 				cttl := 0
@@ -685,17 +730,17 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 				}
 				m.Question = req.Question
 				m.Answer = backupAnswer
-				data, err = m.Pack()
-				if err != nil {
+				rdata, rerr := m.Pack()
+				if rerr != nil {
 					reqState = END
 					break
 				}
 				// The cache is valid ony for the TTL provided by the actual Server
-				respcache.Set(reqKey, data, time.Second*time.Duration(cttl))
+				respcache.Set(reqKey, rdata, time.Second*time.Duration(cttl))
 				m.Id = id
 			}
-			reqState = END
-			break
+			reqState = SEND_RESP
+			fallthrough
 
 		case SEND_RESP:
 			_, err = w.Write(data)
