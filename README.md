@@ -168,14 +168,20 @@ a flag called `revalidation`. Well its time for you to take a look at the flags
 
 ###### Test in real scenario
 
-So you might be thinking that why I need to do so many digging by myself. Guess 
-what you dont have to. The DNS resolver would do autometically for any CNAME it 
-receives. To check it follow the below steps, well be prepared to Die !
-
+In a real deployment scenario a host resolve query by an application results in an recursive query to the resolver. The resolver then makes an interrative query to the DNS server and send the resoponse to the client. Sipahi is meant to run in between resolver and DNS server which makes it behave just like another dns server. 
+   
+In this way for every alias response the resolver autometically run an itterative query to resolve the CNAME  
+This can be checked by local resolver by replacing sipahi as a nameserver/DNS. 
+   
 * Run sipahi
 * If you are using mac    
 ```
 1> Goto System Preference -> Network -> Advanced (for the network you using)
 2> Goto DNS tab and set your localhost (127.0.0.1) as only dns
 ```
-* If you are using any other linux machine find how to change the DNS server
+* If you are using any other linux machine
+```
+1> Open to edit /etc/resolv.conf
+2> Add nameserver as your localhost (127.0.0.1)
+   nameserver 127.0.0.1
+```
