@@ -17,7 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	//	"sync/atomic"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -101,6 +101,8 @@ var (
 	totalDnsQueryCount    uint64 = 0
 	failedDnsQueryCount   uint64 = 0
 	resolvedDnsQueryCount uint64 = 0
+	nxDomainCount         uint64 = 0
+	refusedCount          uint64 = 0
 	totalErrorCount       uint64 = 0
 )
 
@@ -335,36 +337,53 @@ func generateServerCookie(clientCookie string, serverSecret string, clientIp str
 }
 
 func printStats() {
-	fmt.Printf("SIPAHI STAT\n")
-	fmt.Printf("%0*c\n", 30, '-')
-	fmt.Printf("|%30.8s|%10.8s|\n", "COUNTER", "VALUE")
-	fmt.Printf("|%30.8s|%10.8f|\n", "Total Req", totalRequestCount)
-	fmt.Printf("|%30.8s|%10.8f|\n", "Cache Hit", respCacheHitCount)
-	fmt.Printf("|%30.8s|%10.8f|\n", "Validation Req", valReqCount)
-	fmt.Printf("|%30.8s|%10.8f|\n", "Validation Err", valErrCount)
-	fmt.Printf("|%30.8s|%10.8f|\n", "Dns Query", totalDnsQueryCount)
-	fmt.Printf("|%30.8s|%10.8f|\n", "Dns Failure", failedDnsQueryCount)
-	fmt.Printf("|%30.8s|%10.8f|\n", "Total Failure", totalErrorCount)
+	fmt.Printf("\n\nSIPAHI STAT:\n")
+	fmt.Printf("%25.10s |%10.5s \n", "COUNTER", "VALUE")
+	fmt.Printf("-------------------------------------------\n")
+	fmt.Printf("%25.20s |%10d \n", "Total Req", totalRequestCount)
+	fmt.Printf("%25.20s |%10d \n", "Cache Hit", respCacheHitCount)
+	fmt.Printf("%25.20s |%10d \n", "Validation Req", valReqCount)
+	fmt.Printf("%25.20s |%10d \n", "Validation Err", valErrCount)
+	fmt.Printf("%25.20s |%10d \n", "Dns Query", totalDnsQueryCount)
+	fmt.Printf("%25.20s |%10d \n", "Dns Failure", failedDnsQueryCount)
+	fmt.Printf("%25.20s |%10d \n", "Resolved", resolvedDnsQueryCount)
+	fmt.Printf("%25.20s |%10d \n", "NXDomain", nxDomainCount)
+	fmt.Printf("%25.20s |%10d \n", "Refused", refusedCount)
+	fmt.Printf("%25.20s |%10d \n", "Total Failure", totalErrorCount)
+	fmt.Printf("\n")
 }
 
 func main() {
 	dns.HandleFunc(".", proxyServe)
 	defer dns.HandleRemove(".")
 
-	failure := make(chan error, 1)
+	done := make(chan bool, 1)
 
-	go func(failure chan error) {
-		failure <- dns.ListenAndServe(*local, "tcp", nil)
-	}(failure)
+	tcpServer := &dns.Server{Addr: *local, Net: "tcp"}
+	udpServer := &dns.Server{Addr: *local, Net: "udp"}
 
-	go func(failure chan error) {
-		failure <- dns.ListenAndServe(*local, "udp", nil)
-	}(failure)
+	go tcpServer.ListenAndServe()
+	go udpServer.ListenAndServe()
 
 	fmt.Printf("ready for accept connection (tcp/udp) %s...\n", *local)
 
-	fmt.Println(<-failure)
+	sigs := make(chan os.Signal, 1)
 
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigs
+		fmt.Printf("Signal received: %d\n", sig)
+		tcpServer.Shutdown()
+		udpServer.Shutdown()
+		done <- true
+	}()
+
+	// Wait for signal
+	<-done
+	fmt.Println("Shutting Down...")
+
+	// print stats for sipahi
 	printStats()
 }
 
@@ -386,8 +405,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		r              dns.RR
 		reqState       int
 		complete       bool
-		//clientIp       string
-		//clientPort     string
+		//rtt            time.Duration
 	)
 
 	defer func() {
@@ -399,6 +417,9 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 	// set initial req state
 	complete = false
 	reqState = FILTER_REQ
+
+	// increase total request count
+	atomic.AddUint64(&totalRequestCount, 1)
 
 	// request state wheel
 	for !complete {
@@ -463,6 +484,8 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 						reqState = END
 						break
 					}
+					// increase cache hit
+					atomic.AddUint64(&respCacheHitCount, 1)
 					reqState = SEND_RESP
 					break
 				}
@@ -534,38 +557,40 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 				// If Invalidated the error is logged for the specific client
 				errlog := fmt.Sprintf("Invaid req, incident would be logged, reason: %s", reason)
 				err = errors.New(errlog)
+				// update val req count
+				atomic.AddUint64(&valErrCount, 1)
 				reqState = END
 				break
-			} else {
-				// Before going to ask DNS, map the alias request to its actual Domain
-				// TODO: Do it for Each of the Quesions in Req
-				//       There should be a CNAME entry in the validity data that maps to actual query
-
-				// Keep a backup of questions for response
-				for _, q := range req.Question {
-					actualQuestion = append(actualQuestion, q)
-				}
-
-				// Keep a backup of questions for response
-				for _, a := range m.Answer {
-					cachedAns = append(cachedAns, a)
-				}
-
-				// MAP Domain from CNAME
-				req.Question = resolveDomainFromCname(req.Question, m.Answer)
-
-				/* TODO: Generate the revalidation period as of the TTL
-				 *       Current revalidation period is fixed for each request we might want to enforece
-				 *       the revalidation period based on the DNS resp ttl
-				 */
-				validatedRequesterKey := generateValidationKey(req, w)
-				validatedcache.Set(validatedRequesterKey, data, time.Second*time.Duration(*revalidation))
-
-				reqState = PERFORM_DNS
-				break
 			}
-			reqState = VALIDITY_CHECK
-			fallthrough
+			// Before going to ask DNS, map the alias request to its actual Domain
+			// TODO: Do it for Each of the Quesions in Req
+			//       There should be a CNAME entry in the validity data that maps to actual query
+
+			// Keep a backup of questions for response
+			for _, q := range req.Question {
+				actualQuestion = append(actualQuestion, q)
+			}
+
+			// Keep a backup of questions for response
+			for _, a := range m.Answer {
+				cachedAns = append(cachedAns, a)
+			}
+
+			// MAP Domain from CNAME
+			req.Question = resolveDomainFromCname(req.Question, m.Answer)
+
+			/* TODO: Generate the revalidation period as of the TTL
+			 *       Current revalidation period is fixed for each request we might want to enforece
+			 *       the revalidation period based on the DNS resp ttl
+			 */
+			validatedRequesterKey := generateValidationKey(req, w)
+			validatedcache.Set(validatedRequesterKey, data, time.Second*time.Duration(*revalidation))
+
+			// update val req count
+			atomic.AddUint64(&valReqCount, 1)
+
+			reqState = PERFORM_DNS
+			break
 
 		case VALIDITY_CHECK:
 			// Check if the req is Validated
@@ -665,7 +690,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			break
 
 		case PERFORM_DNS:
-			// If a User is validated Ask the DNSs
+			// If a Client is validated Ask the DNSs
 			// Currently RR:
 			//        which ever gives the Ans First would be selected
 			req.RecursionDesired = true
@@ -675,24 +700,53 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			reqKey = generateReqKey(req)
 			req.Id = id
 
-			for _, parts := range DNS {
-				dns := parts[0]
-				proto := parts[1]
+			// Request all DNS in round robin fashion
+			for _, dnsData := range DNS {
+				dns := dnsData[0]
+				proto := dnsData[1]
 				client := clientUDP
 				if proto == "tcp" {
 					client = clientTCP
 				}
+				atomic.AddUint64(&totalDnsQueryCount, 1)
+				//m, rtt, err = client.Exchange(req, dns)
 				m, _, err = client.Exchange(req, dns)
 				if err == nil && len(m.Answer) > 0 {
-					// used = dns
 					break
 				}
+				atomic.AddUint64(&failedDnsQueryCount, 1)
 			}
 
 			if err != nil {
 				reqState = END
 				break
 			}
+
+			// TODO: Check response code for the ans
+			responseCode := m.Rcode
+			switch responseCode {
+			// Query Refused : Refused
+			case dns.RcodeRefused:
+				atomic.AddUint64(&refusedCount, 1)
+				atomic.AddUint64(&totalErrorCount, 1)
+
+			// Non-Existent Domain : NXDomain
+			case dns.RcodeNameError:
+				atomic.AddUint64(&nxDomainCount, 1)
+				atomic.AddUint64(&totalErrorCount, 1)
+
+			// No Error
+			case dns.RcodeSuccess:
+				atomic.AddUint64(&resolvedDnsQueryCount, 1)
+			// Other Error
+			default:
+				//fmt.Printf("%s\n", dns.RcodeToString[responseCode])
+				atomic.AddUint64(&totalErrorCount, 1)
+			}
+
+			// TODO: Update RTT debug information
+			//fmt.Printf("rtt: %d\n", rtt)
+
 			m.RecursionAvailable = false
 
 			// In the response the Question should have the response asked in the request
