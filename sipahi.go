@@ -62,6 +62,7 @@ var (
 	local        = flag.String("local", ":53", "local listen address")
 	debug        = flag.Int("debug", 0, "debug level 0 1 2")
 	encache      = flag.Bool("cache", true, "enable cache")
+	validate     = flag.Bool("validate", true, "enable validation")
 	expire       = flag.Int64("expire", 3600, "default cache expire seconds, -1 means use domain ttl time")
 	revalidation = flag.Int64("revalidation", 1800, "default revalidation period, -1 means never revalidate")
 	ttl          = flag.Int64("ttl", 1800, "default ttl that will be set as validation period")
@@ -76,8 +77,9 @@ var (
 	clientTCP *dns.Client
 	clientUDP *dns.Client
 
-	DEBUG   int
-	ENCACHE bool
+	DEBUG      int
+	ENCACHE    bool
+	VALIDATION bool
 
 	// The list of DNSs
 	DNS [][]string
@@ -176,6 +178,7 @@ func init() {
 	flag.Parse()
 
 	ENCACHE = *encache
+	VALIDATION = *validate
 	DEBUG = *debug
 
 	runtime.GOMAXPROCS(runtime.NumCPU()*2 - 1)
@@ -494,6 +497,13 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			fallthrough
 
 		case VALIDATE:
+
+			// If validation is disabled goto perform DNS
+			if !VALIDATION {
+				reqState = PERFORM_DNS
+				break
+			}
+
 			// Check if CNAME query of earlier request
 			if earlierreq, ok := validitycache.Get(validationKey); ok {
 				data, _ = earlierreq.([]byte)
@@ -593,6 +603,13 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			break
 
 		case VALIDITY_CHECK:
+
+			// If validation is disabled goto perform DNS
+			if !VALIDATION {
+				reqState = PERFORM_DNS
+				break
+			}
+
 			// Check if the req is Validated
 			if reply, ok := validatedcache.Get(validationKey); ok {
 				data, _ = reply.([]byte)
