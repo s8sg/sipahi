@@ -1,9 +1,9 @@
-SIPAHI is a transparent dns proxy that work as a traffic rate limiter for dns servers
+SIPAHI is a transparent DNS proxy that works as a traffic rate limiter for DNS servers
 
 **NOTE**
 * Its Transparent in Layer 7
 * Works with any DNS resolver
-* Meant to protect only DNS from DDOS
+* Meant to protect DNS from DDOS
 
 
 ##### Getting Started
@@ -42,22 +42,37 @@ Usage of ./sipahi:
   -ttl int
     	default ttl that will be set as validation period (default 1800)
 ```
-Yeah thats a lot of flags, but the best part you dont need to know any for test
-Cheers!
+running with default values: 
 ```
 $ sudo ./sipahi
 ready for accept connection on tcp/udp :53 ...
+^CSignal received: 2
+Shutting Down...
+SIPAHI STAT:
+                  COUNTER |     VALUE 
+-------------------------------------------
+                Total Req |    155522 
+                Cache Hit |    100532 
+           Validation Req |      1400 
+           Validation Err |         0 
+                Dns Query |      3984 
+              Dns Failure |      2570 
+                 Resolved |      1418 
+                 NXDomain |        66 
+                  Refused |         0 
+            Total Failure |        66 
 ```
 
 ##### How Sipahi Works
    
    
-###### Understandinh how sipahi verify resolver
+###### Understanding how sipahi verify resolver
 
 Verification of a resolver is required in case the resolver is making request at high rate  
-Verification loop can be debugged by disabling the rate limit  
-
-Dig it  
+Validation loop can be debugged by disabling the rate limit  
+Validation can also be disabled by providing flag `-validate=false`  
+  
+To check sipahi validation loop, lets dig for a domain name `google.com` 
 ```bash
 $ dig @127.0.0.1 google.com
 
@@ -81,7 +96,7 @@ google.com.		1800	IN	CNAME	472f0851a62dfc74c5bee85b5c64a546.google.com.
 ;; MSG SIZE  rcvd: 95
 ```
 It will returned a CNAME <req_identity>.google.com  
-Dig it again
+On CNAME response resolver should try to resolve the CNAME like below  
 ```bash
 $ dig @127.0.0.1 472f0851a62dfc74c5bee85b5c64a546.google.com
 
@@ -104,9 +119,10 @@ $ dig @127.0.0.1 472f0851a62dfc74c5bee85b5c64a546.google.com
 ;; WHEN: Fri Sep 15 18:26:53 2017
 ;; MSG SIZE  rcvd: 120
 ```
-It got the IP from actual resolved address. Guess what, in the meantime you are
-verified. Congrats !  
-Dig again for the actual domain  
+It got the IP from actual resolved address  
+Once it gets a request for the ealier CNAME, it vaidates the client  
+A resolver should always make an iterative query for the CNAME response  
+Now when a request for the same domain from same client is received, the client is already verified for the same    
 ```bash
 dig @127.0.0.1 google.com                                 
 
@@ -129,9 +145,10 @@ google.com.		299	IN	A	172.217.27.78
 ;; WHEN: Fri Sep 15 18:27:06 2017
 ;; MSG SIZE  rcvd: 54
 ```
-Woohoo you are verified and you got the response within a sec 0   
+we are verified and you got the response within a sec 0  
+Once sipahi got the actual DNS response, it caches the DNS response into response cache  
    
-Now Wait for 5 min and dig again  
+The response cache should expire after 5 min  
 ```bash
 $ dig @127.0.0.1 google.com
 
@@ -154,23 +171,22 @@ google.com.		299	IN	A	172.217.27.78
 ;; WHEN: Fri Sep 15 18:31:31 2017
 ;; MSG SIZE  rcvd: 54
 ```
-You see it took 7ms now. Cause the resp cache in sipahi is expired after the TTL 
-period (as of the resp from DNS: 299) but you are still verified, so enjoy !
+it took 7ms now. Cause the resp cache in sipahi is expired after the TTL 
+period (299ms) but the validation cache is maintained!  
+    
+After 10min the validation cache would be expired too and a re-validation  
+would be forced  
    
-If you wait for 10min your verification cache would be expired too and you would
-be forced to be verified again. Be prepared !
-   
-If you thinking about how to control the verification cache expiration time, find
-a flag called `revalidation`. Well its time for you to take a look at the flags
+`revalidation` flag can be used to change the revalidation period  
    
    
    
 
 ###### Test in real scenario
 
-In a real deployment scenario a host resolve query by an application results in an recursive query to the resolver. The resolver then makes an interrative query to the DNS server and send the resoponse to the client. Sipahi is meant to run in between resolver and DNS server which makes it behave just like another dns server. 
-   
-In this way for every alias response the resolver autometically run an itterative query to resolve the CNAME  
+In a real deployment scenario, a host resolve query by application results in a recursive query to the resolver. The resolver then makes an iterative query to the DNS server and send the response to the client. Sipahi is meant to run in between resolver and DNS server which makes it behave just like another dns server. 
+    
+    
 This can be checked by local resolver by replacing sipahi as a nameserver/DNS. 
    
 * Run sipahi
