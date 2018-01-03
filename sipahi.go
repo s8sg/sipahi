@@ -390,6 +390,87 @@ func main() {
 	printStats()
 }
 
+// perform filter
+func filterReq(req *dns.Msg) bool {
+	var (
+		query     []string
+		questions []dns.Question
+	)
+	// If its a Response, we treat it as Invalid (DROP)
+	if req.MsgHdr.Response == true {
+		return false
+	}
+
+	query = make([]string, len(req.Question))
+
+	// Filter out IPV6 and AAAA Entry from queries (DROP)
+	for i, q := range req.Question {
+		if q.Qtype != dns.TypeAAAA || *ipv6 {
+			questions = append(questions, q)
+		}
+		query[i] = fmt.Sprintf("(%s %s %s)", q.Name, dns.ClassToString[q.Qclass], dns.TypeToString[q.Qtype])
+	}
+
+	// Invalid Question Length (DROP)
+	if len(questions) == 0 {
+		return false
+	}
+
+	/* TODO: sipahi should support multiple query but DNS doesn't
+	 *       We sould be able to integently Distribute the
+	 *       questions to multiple DNSs in different request
+	 */
+	req.Question = questions
+	return true
+}
+
+// perform response cache check
+func cacheHitCheck(reqKey string) *dns.Msg {
+	var (
+		data []byte
+		m    *dns.Msg
+	)
+	// If Cache Enable check if we have already cached the content
+	if !ENCACHE {
+		return nil
+	}
+	if reply, ok := respcache.Get(reqKey); ok {
+		data, _ = reply.([]byte)
+	}
+	if data != nil && len(data) > 0 {
+		m = &dns.Msg{}
+		m.Unpack(data)
+		// increase cache hit
+		atomic.AddUint64(&respCacheHitCount, 1)
+		return m
+	}
+	return nil
+}
+
+// set response cache
+func populateCache(reqKey string, m *dns.Msg, questions []dns.Question, answers []dns.RR) bool {
+	if !ENCACHE {
+		return true
+	}
+	m.Id = 0
+	cttl := 0
+	if len(m.Answer) > 0 {
+		cttl = int(m.Answer[0].Header().Ttl)
+		if cttl < 0 {
+			cttl = 0
+		}
+	}
+	m.Question = questions
+	m.Answer = answers
+	rdata, rerr := m.Pack()
+	if rerr != nil {
+		return false
+	}
+	// The cache is valid only for the TTL provided by the actual Server
+	respcache.Set(reqKey, rdata, time.Second*time.Duration(cttl))
+	return true
+}
+
 // This method is invoked whenever a DNS req reaches sipahi
 func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 	var (
@@ -430,32 +511,9 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		switch reqState {
 
 		case FILTER_REQ:
-			// If its a Response, we treat it as Invalid (DROP)
-			if req.MsgHdr.Response == true {
+			if !filterReq(req) {
 				return
 			}
-
-			query = make([]string, len(req.Question))
-
-			// Filter out IPV6 and AAAA Entry from queries (DROP)
-			for i, q := range req.Question {
-				if q.Qtype != dns.TypeAAAA || *ipv6 {
-					questions = append(questions, q)
-				}
-				query[i] = fmt.Sprintf("(%s %s %s)", q.Name, dns.ClassToString[q.Qclass], dns.TypeToString[q.Qtype])
-			}
-
-			// Invalid Question Length (DROP)
-			if len(questions) == 0 {
-				return
-			}
-
-			/* TODO: sipahi should support multiple query but DNS doesn't
-			 *       We sould be able to integently Distribute the
-			 *       questions to multiple DNSs in different request
-			 */
-			req.Question = questions
-
 			reqState = PARSE_REQ
 			fallthrough
 
@@ -473,25 +531,16 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			fallthrough
 
 		case RESP_CACHE_CHECK:
-			// If Cache Enable check if we have already cached the content
-			if ENCACHE {
-				if reply, ok := respcache.Get(reqKey); ok {
-					data, _ = reply.([]byte)
-				}
-				if data != nil && len(data) > 0 {
-					m = &dns.Msg{}
-					m.Unpack(data)
-					m.Id = id
-					data, err = m.Pack()
-					if err != nil {
-						reqState = END
-						break
-					}
-					// increase cache hit
-					atomic.AddUint64(&respCacheHitCount, 1)
-					reqState = SEND_RESP
+			m = cacheHitCheck(reqKey)
+			if m != nil {
+				m.Id = id
+				data, err = m.Pack()
+				if err != nil {
+					reqState = END
 					break
 				}
+				reqState = SEND_RESP
+				break
 			}
 			reqState = VALIDATE
 			fallthrough
@@ -790,25 +839,10 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			fallthrough
 
 		case ADD_RESP_CACHE:
-			if ENCACHE {
-				m.Id = 0
-				cttl := 0
-				if len(m.Answer) > 0 {
-					cttl = int(m.Answer[0].Header().Ttl)
-					if cttl < 0 {
-						cttl = 0
-					}
-				}
-				m.Question = req.Question
-				m.Answer = backupAnswer
-				rdata, rerr := m.Pack()
-				if rerr != nil {
-					reqState = END
-					break
-				}
-				// The cache is valid ony for the TTL provided by the actual Server
-				respcache.Set(reqKey, rdata, time.Second*time.Duration(cttl))
-				m.Id = id
+			ok := populateCache(reqKey, m, req.Question, backupAnswer)
+			if !ok {
+				reqState = END
+				break
 			}
 			reqState = SEND_RESP
 			fallthrough
