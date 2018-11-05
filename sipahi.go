@@ -6,8 +6,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/miekg/dns"
+	"github.com/golang/snappy"
+	//"github.com/miekg/dns"
 	"github.com/pmylund/go-cache"
+	kcp "github.com/xtaci/kcp-go"
+	"github.com/xtaci/smux"
+	"golang.org/x/crypto/pbkdf2"
 	"hash/fnv"
 	"log"
 	"net"
@@ -103,6 +107,92 @@ var (
 	resolvedDnsQueryCount uint64 = 0
 	totalErrorCount       uint64 = 0
 )
+
+type compStream struct {
+	conn net.Conn
+	w    *snappy.Writer
+	r    *snappy.Reader
+}
+
+func (c *compStream) Read(p []byte) (n int, err error) {
+	return c.r.Read(p)
+}
+
+func (c *compStream) Write(p []byte) (n int, err error) {
+	n, err = c.w.Write(p)
+	err = c.w.Flush()
+	return n, err
+}
+
+func (c *compStream) Close() error {
+	return c.conn.Close()
+}
+
+func newCompStream(conn net.Conn) *compStream {
+	c := new(compStream)
+	c.conn = conn
+	c.w = snappy.NewBufferedWriter(conn)
+	c.r = snappy.NewReader(conn)
+	return c
+}
+
+// handle multiplex-ed connection
+func handleMux(conn io.ReadWriteCloser, config *Config) {
+	// stream multiplex
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.MaxReceiveBuffer = config.SockBuf
+	smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
+
+	mux, err := smux.Server(conn, smuxConfig)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer mux.Close()
+	for {
+		p1, err := mux.AcceptStream()
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		p2, err := net.DialTimeout("tcp", config.Target, 5*time.Second)
+		if err != nil {
+			p1.Close()
+			log.Println(err)
+			continue
+		}
+		go handleClient(p1, p2, config.Quiet)
+	}
+}
+
+func handleClient(p1, p2 io.ReadWriteCloser, quiet bool) {
+	if !quiet {
+		log.Println("stream opened")
+		defer log.Println("stream closed")
+	}
+	defer p1.Close()
+	defer p2.Close()
+
+	// start tunnel
+	p1die := make(chan struct{})
+	go func() { io.Copy(p1, p2); close(p1die) }()
+
+	p2die := make(chan struct{})
+	go func() { io.Copy(p2, p1); close(p2die) }()
+
+	// wait for tunnel termination
+	select {
+	case <-p1die:
+	case <-p2die:
+	}
+}
+
+func checkError(err error) {
+	if err != nil {
+		log.Printf("%+v\n", err)
+		os.Exit(-1)
+	}
+}
 
 func toMd5(data string) string {
 	m := md5.New()
